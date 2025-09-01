@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"           # Lambda-compatible
+          python-version: "3.11"      # Lambda-compatible (avoid 3.13)
       - name: Install deps
         run: |
           python -m venv env
@@ -34,7 +34,7 @@ jobs:
     needs: test
     if: github.event_name == 'push' && needs.test.result == 'success'
     runs-on: ubuntu-latest
-    environment: prod                  # ← this makes env “prod” secrets available
+    environment: prod                 # <- uses Environment "prod" secrets
     concurrency: deploy-main
     steps:
       - uses: actions/checkout@v4
@@ -48,9 +48,10 @@ jobs:
           source env/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install awscli jq
+          pip install awscli
+          sudo apt-get update -y
+          sudo apt-get install -y jq
 
-      # Optional: fail fast if required secrets are missing
       - name: Check AWS secrets present
         env:
           AKID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -75,16 +76,20 @@ jobs:
 
       - name: Inject .env into Zappa environment_variables (prod stage)
         run: |
+          # Convert .env into JSON
           python - <<'PY' > env.json
 import json, pathlib
 env={}
 p=pathlib.Path(".env")
 if p.exists():
   for line in p.read_text().splitlines():
-    if not line.strip() or line.strip().startswith("#"): continue
-    k,_,v=line.partition("="); env[k.strip()]=v.strip()
+    if not line.strip() or line.strip().startswith("#"):
+      continue
+    k,_,v=line.partition("=")
+    env[k.strip()]=v.strip()
 print(json.dumps(env))
 PY
+          # Merge into zappa_settings.json -> .prod.environment_variables
           tmp=zs.tmp.json
           jq --slurpfile e env.json \
              '.prod.environment_variables |= (. + ($e[0]))' \
@@ -93,13 +98,8 @@ PY
       - name: Compute Lambda function name
         id: name
         run: |
-          NAME=$(python - <<'PY'
-import json
-s=json.load(open('zappa_settings.json'))
-print(f"{s['prod']['project_name']}-prod")
-PY
-)
-          echo "lambda=$NAME" >> $GITHUB_OUTPUT
+          NAME="$(jq -r '.prod.project_name + "-prod"' zappa_settings.json)"
+          echo "lambda=$NAME" >> "$GITHUB_OUTPUT"
 
       - name: Deploy or update with Zappa
         run: |
@@ -120,4 +120,3 @@ PY
         run: |
           source env/bin/activate
           zappa status prod || true
-
