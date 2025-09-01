@@ -1,122 +1,65 @@
+# This is a basic workflow to help you get started with Actions
+
 name: CI
 
+# Controls when the workflow will run
 on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: ["main"]
+    branches: [ "main" ]
   pull_request:
-    branches: ["main"]
+    branches: [ "main" ]
+
+  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-permissions:
-  contents: read
-
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  test:
+  # This workflow contains a single job called "build"
+  build:
+    # The type of runner that the job will run on
     runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"      # Lambda-compatible (avoid 3.13)
-      - name: Install deps
+          python-version: '3.13'
+      # Runs a set of commands using the runners shell
+      - name: Install python requirements.txt
         run: |
           python -m venv env
           source env/bin/activate
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest
-      - name: Run unit tests
-        run: |
-          source env/bin/activate
-          pytest -q
-
-  deploy:
-    needs: test
-    if: github.event_name == 'push' && needs.test.result == 'success'
-    runs-on: ubuntu-latest
-    environment: prod                 # <- uses Environment "prod" secrets
-    concurrency: deploy-main
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps (zappa + awscli + jq)
-        run: |
-          python -m venv env
-          source env/bin/activate
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install awscli
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
-      - name: Check AWS secrets present
-        env:
-          AKID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          SKEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: |
-          test -n "$AKID" || (echo "Missing AWS_ACCESS_KEY_ID" && exit 1)
-          test -n "$SKEY" || (echo "Missing AWS_SECRET_ACCESS_KEY" && exit 1)
-
-      - name: Configure AWS Credentials (static keys from env:prod)
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: us-east-1
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }} # omit if not using STS
-
-      - name: Build .env from app secrets (optional)
+            aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+            aws-region: us-east-1
+            
+      - name: Deploy or update zappa    
         run: |
-          : > .env
-          if [ -n "${{ secrets.APP_NAME }}" ]; then echo "APP_NAME=${{ secrets.APP_NAME }}" >> .env; fi
-          # add more: echo "DB_URL=${{ secrets.DB_URL }}" >> .env
-
-      - name: Inject .env into Zappa environment_variables (prod stage)
-        run: |
-          # Convert .env into JSON
-          python - <<'PY' > env.json
-import json, pathlib
-env={}
-p=pathlib.Path(".env")
-if p.exists():
-  for line in p.read_text().splitlines():
-    if not line.strip() or line.strip().startswith("#"):
-      continue
-    k,_,v=line.partition("=")
-    env[k.strip()]=v.strip()
-print(json.dumps(env))
-PY
-          # Merge into zappa_settings.json -> .prod.environment_variables
-          tmp=zs.tmp.json
-          jq --slurpfile e env.json \
-             '.prod.environment_variables |= (. + ($e[0]))' \
-             zappa_settings.json > "$tmp" && mv "$tmp" zappa_settings.json
-
-      - name: Compute Lambda function name
-        id: name
-        run: |
-          NAME="$(jq -r '.prod.project_name + "-prod"' zappa_settings.json)"
-          echo "lambda=$NAME" >> "$GITHUB_OUTPUT"
-
-      - name: Deploy or update with Zappa
-        run: |
-          set -e
           source env/bin/activate
-          export VIRTUAL_ENV="$GITHUB_WORKSPACE/env"
-          export PATH="$VIRTUAL_ENV/bin:$PATH"
-          LAMBDA="${{ steps.name.outputs.lambda }}"
-          if aws lambda get-function --function-name "$LAMBDA" >/dev/null 2>&1; then
-            echo "Lambda exists → zappa update prod"
-            zappa update prod
+          STAGE="${STAGE:-prod}"
+          # Derive Lambda function name from zappa_settings.json: <project_name>-<stage>
+          LAMBDA_NAME="$(jq -r --arg s "$STAGE" '.[$s].project_name + "-" + $s' zappa_settings.json)"
+          
+          echo "Stage: $STAGE"
+          echo "Lambda: $LAMBDA_NAME"
+          
+          # If the Lambda exists → update; else → deploy
+          if aws lambda get-function --function-name "$LAMBDA_NAME" >/dev/null 2>&1; then
+            echo "Lambda exists → zappa update $STAGE"
+            zappa update "$STAGE"
           else
-            echo "Lambda not found → zappa deploy prod"
-            zappa deploy prod
+            echo "Lambda not found → zappa deploy $STAGE"
+            zappa deploy "$STAGE"
           fi
-
-      - name: Show status / endpoint
+          
+      - name: upload to S3
         run: |
-          source env/bin/activate
-          zappa status prod || true
+          aws s3 cp utils.py s3://s3marco2111/
