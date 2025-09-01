@@ -2,59 +2,69 @@
 
 name: CI
 
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
+    branches: ["main"]
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
   build:
-    # 👇 This makes Environment "prod" secrets available as ${{ secrets.* }}
+    # Make Environment "prod" secrets available in ${{ secrets.* }}
     environment: prod
-
-    # The type of runner that the job will run on
     runs-on: ubuntu-latest
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
-      # Runs a set of commands using the runners shell
+          # 3.11 is Lambda/Zappa-friendly; keep 3.13 if you really need it
+          python-version: "3.11"
+
       - name: Install python requirements.txt
         run: |
           python -m venv env
           source env/bin/activate
           pip install -r requirements.txt
+
+      # Secrets are NOT available to workflows triggered by PRs from forks.
+      # We gate AWS steps to 'push' so PRs still succeed.
+      - name: Check AWS secrets present (only on push)
+        if: github.event_name == 'push'
+        env:
+          AKID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          SKEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          test -n "$AKID" || (echo "::error::Missing AWS_ACCESS_KEY_ID (add to repo or env: prod secrets)" && exit 1)
+          test -n "$SKEY" || (echo "::error::Missing AWS_SECRET_ACCESS_KEY (add to repo or env: prod secrets)" && exit 1)
+
       - name: Configure AWS Credentials
+        if: github.event_name == 'push'
         uses: aws-actions/configure-aws-credentials@v4
         with:
-            aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-            aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-            aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-            aws-region: us-east-1
-            
-      - name: Deploy or update zappa    
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }} # omit if not using STS
+          aws-region: us-east-1
+
+      - name: Deploy or update zappa
+        if: github.event_name == 'push'
         run: |
           source env/bin/activate
           STAGE="${STAGE:-prod}"
-          # Derive Lambda function name from zappa_settings.json: <project_name>-<stage>
+          # Derive Lambda name: <project_name>-<stage> from zappa_settings.json
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y jq
+          fi
           LAMBDA_NAME="$(jq -r --arg s "$STAGE" '.[$s].project_name + "-" + $s' zappa_settings.json)"
-          
+          if [ -z "$LAMBDA_NAME" ] || [ "$LAMBDA_NAME" = "null" ]; then
+            echo "::error::Could not read project_name for stage '$STAGE' from zappa_settings.json"
+            exit 1
+          fi
           echo "Stage: $STAGE"
           echo "Lambda: $LAMBDA_NAME"
-          
-          # If the Lambda exists → update; else → deploy
           if aws lambda get-function --function-name "$LAMBDA_NAME" >/dev/null 2>&1; then
             echo "Lambda exists → zappa update $STAGE"
             zappa update "$STAGE"
@@ -62,7 +72,8 @@ jobs:
             echo "Lambda not found → zappa deploy $STAGE"
             zappa deploy "$STAGE"
           fi
-          
+
       - name: upload to S3
+        if: github.event_name == 'push'
         run: |
           aws s3 cp utils.py s3://s3marco2111/
